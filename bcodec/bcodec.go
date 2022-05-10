@@ -10,6 +10,8 @@ import (
 	"github.com/anacrolix/torrent/bencode"
 )
 
+// TODO fill in missing fields and corresponding b-decode logic
+
 // meta info file content
 type Torrent struct {
 	Info         *TorrentInfo
