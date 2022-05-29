@@ -3,6 +3,7 @@ package bcodec
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -93,7 +94,7 @@ func TestBedecode(t *testing.T) {
 					[]byte("\xbd\xf1\x3d\xff\x92\xe2\x8c\x98\xbd\xb2\x3d\xbc\x20\xe2\x8c\x98\xbd\xb2\x3d\xbc\xbd\xf1\x3d\xff\x92\xe2\x8c\x98\xbd\xb2\x3d\xbc\x20\xe2\x8c\x98\xbd\xb2\x3d\xbc"),
 					x.Pieces)
 				assert.NotNil(t, x.LenBytes)
-				assert.Equal(t, int64(2048), *x.LenBytes)
+				assert.Equal(t, int64(2048), x.LenBytes)
 				assert.Nil(t, x.Files)
 			},
 		},
@@ -118,7 +119,8 @@ func TestBedecode(t *testing.T) {
 						{LenBytes: 123, Path: filepath.Join("foo", "bar", "qux.mp4")},
 						{LenBytes: 456, Path: filepath.Join("ham", "eggs", "hot.avi")},
 					}, x.Files)
-				assert.Nil(t, x.LenBytes)
+				// length shall has value of totla file content size
+				assert.Equal(t, int64(579), x.LenBytes)
 			},
 		},
 		{
@@ -150,8 +152,123 @@ func TestBedecode(t *testing.T) {
 							{LenBytes: 123, Path: filepath.Join("foo", "bar", "qux.mp4")},
 							{LenBytes: 456, Path: filepath.Join("ham", "eggs", "hot.avi")},
 						},
+						LenBytes: 579,
 					},
 				}, tr)
+			},
+		},
+		{
+			name:   "TrackerRsp: w/ failure reason",
+			target: &TrackerRsp{},
+			data:   []byte("d14:failure reason5:boom!e"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				rsp := target.(*TrackerRsp)
+				assert.Equal(t, "boom!", *rsp.FailureReason)
+				assert.Nil(t, rsp.WarningMsg)
+				assert.Nil(t, rsp.PollInterval)
+				assert.Nil(t, rsp.TrackerID)
+				assert.Nil(t, rsp.SeederCnt)
+				assert.Nil(t, rsp.LeecherCnt)
+				assert.Nil(t, rsp.PeerAddrs)
+			},
+		},
+
+		{
+			name:   "PeerAddrs: empty list",
+			target: &PeerAddrs{},
+			data:   []byte("le"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				pa := target.(*PeerAddrs)
+				assert.Equal(t, 0, len(*pa))
+			},
+		},
+		{
+			name:   "PeerAddrs: empty string",
+			target: &PeerAddrs{},
+			data:   []byte("0:"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				pa := target.(*PeerAddrs)
+				assert.Equal(t, 0, len(*pa))
+			},
+		},
+		{
+			name:   "PeerAddrs: multiple peers in binary mode",
+			target: &PeerAddrs{},
+			// place significant bits on low (left) end for each byte to maintain network byte order
+			data: []byte("12:\x43\xd7\xf6\xca\x1a\xe1\xbe\x73\x1f\xda\x1a\xe3"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				pa := target.(*PeerAddrs)
+				assert.Equal(t, PeerAddrs{
+					"67.215.246.202:6881",
+					"190.115.31.218:6883",
+				}, *pa)
+			},
+		},
+		{
+			name:   "PeerAddrs: multiple peers in binary mode - incorrect peer list byte string length",
+			target: &PeerAddrs{},
+			// place significant bits on low (left) end for each byte to maintain network byte order
+			data: []byte("13:\x43\x78\xd7\xf6\xca\x1a\xe1\xbe\x73\x1f\xda\x1a\xe3"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.NotNil(t, err)
+				t.Logf("error parsing peer addresses: %T %[1]s", err)
+			},
+		},
+		{
+			name:   "PeerAddrs: multiple peers in list-of-dictionary mode",
+			target: &PeerAddrs{},
+			data:   []byte("ld2:ip14:67.215.246.2024:porti6881e7:peer id4:junked2:ip14:190.115.31.2184:porti6883eee"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				pa := target.(*PeerAddrs)
+				assert.Equal(t, PeerAddrs{
+					"67.215.246.202:6881",
+					"190.115.31.218:6883",
+				}, *pa)
+			},
+		},
+		{
+			name:   "TrackerRsp: w/ peer list in list-of-dictionary mode",
+			target: &TrackerRsp{},
+			data:   []byte("d15:warning message5:boom!8:intervali60e12:min intervali30e10:tracker id3:xyz8:completei1024e10:incompletei2048e5:peersld2:ip14:67.215.246.2024:porti6881e7:peer id4:junked2:ip14:190.115.31.2184:porti6883eeee"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				actual := target.(*TrackerRsp)
+				assert.Equal(t, &TrackerRsp{
+					WarningMsg:   func() *string { v := "boom!"; return &v }(),
+					PollInterval: func() *time.Duration { v := 30 * time.Second; return &v }(),
+					TrackerID:    func() *string { v := "xyz"; return &v }(),
+					SeederCnt:    func() *int { v := 1024; return &v }(),
+					LeecherCnt:   func() *int { v := 2048; return &v }(),
+					PeerAddrs: PeerAddrs{
+						"67.215.246.202:6881",
+						"190.115.31.218:6883",
+					},
+				}, actual)
+			},
+		},
+		{
+			name:   "TrackerRsp: w/ peer list in binary mode",
+			target: &TrackerRsp{},
+			data:   []byte("d15:warning message5:boom!8:intervali30e12:min intervali60e10:tracker id3:xyz8:completei1024e10:incompletei2048e5:peers12:\x43\xd7\xf6\xca\x1a\xe1\xbe\x73\x1f\xda\x1a\xe3e"),
+			verify: func(t *testing.T, target bencode.Unmarshaler, err error) {
+				assert.Nil(t, err)
+				actual := target.(*TrackerRsp)
+				assert.Equal(t, &TrackerRsp{
+					WarningMsg:   func() *string { v := "boom!"; return &v }(),
+					PollInterval: func() *time.Duration { v := 60 * time.Second; return &v }(),
+					TrackerID:    func() *string { v := "xyz"; return &v }(),
+					SeederCnt:    func() *int { v := 1024; return &v }(),
+					LeecherCnt:   func() *int { v := 2048; return &v }(),
+					PeerAddrs: PeerAddrs{
+						"67.215.246.202:6881",
+						"190.115.31.218:6883",
+					},
+				}, actual)
 			},
 		},
 	}

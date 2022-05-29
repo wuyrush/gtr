@@ -2,8 +2,12 @@ package bcodec
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
+	"net"
+	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -24,14 +28,15 @@ type Torrent struct {
 
 func (x *Torrent) UnmarshalBencode(raw []byte) error {
 	// TODO should we worry about GC? of anonymous struct like such?
+	// available tags can be found at https://github.com/anacrolix/torrent/blob/master/bencode/tags.go
 	tmp := struct {
 		Info              *TorrentInfo `bencode:"info"`
 		Announce          string       `bencode:"announce"`
-		AnnounceList      [][]string   `bencode:"announce-list"`
-		Comment           *string      `bencode:"comment"`
-		CreationTimestamp *int64       `bencode:"creation date"`
-		HttpSeeds         []string     `bencode:"httpseeds"`
-		DhtNode           []*DhtNode   `bencode:"nodes"`
+		AnnounceList      [][]string   `bencode:"announce-list,omitempty"`
+		Comment           *string      `bencode:"comment,omitempty"`
+		CreationTimestamp *int64       `bencode:"creation date,omitempty"`
+		HttpSeeds         []string     `bencode:"httpseeds,omitempty"`
+		DhtNode           []*DhtNode   `bencode:"nodes,omitempty"`
 	}{}
 	if err := bencode.Unmarshal(raw, &tmp); err != nil {
 		return fmt.Errorf("error decoding anonymous struct for Torrent: %w", err)
@@ -92,8 +97,9 @@ type TorrentInfo struct {
 	Hash          []byte // info dictionary sha1 hash
 	PieceLenBytes int64
 	Pieces        []byte
-	LenBytes      *int64
-	Files         []*FileSpec
+	// TODO make this always available as the total length of the file
+	LenBytes int64
+	Files    []*FileSpec
 }
 
 func (x *TorrentInfo) UnmarshalBencode(raw []byte) error {
@@ -118,14 +124,41 @@ func (x *TorrentInfo) UnmarshalBencode(raw []byte) error {
 	x.Name = tmp.Name
 	x.PieceLenBytes = tmp.PieceLenBytes
 	x.Pieces = []byte(tmp.Pieces)
-	x.LenBytes = tmp.LenBytes
 	x.Files = tmp.Files
+	// TODO verify that value of length field / aggregated length value of all files involved is identical to
+	// the product of piece length and # piece hashes present in torrent file, instead of blindly trust the
+	// length values
+	if tmp.LenBytes != nil {
+		// overflow?
+		if *tmp.LenBytes < 0 {
+			return fmt.Errorf("got negative total size of file content")
+		}
+		x.LenBytes = *tmp.LenBytes
+	} else {
+		totalBytes, err := totalFileSizeBytes(x.Files)
+		if err != nil {
+			return err
+		}
+		x.LenBytes = totalBytes
+	}
 	// compute info hash. hash.Hash.Write() never return an error
 	h := sha1.New()
-	h.Write(raw)
+	_, _ = h.Write(raw)
 	buf := make([]byte, 0, 20)
 	x.Hash = h.Sum(buf)
 	return nil
+}
+
+func totalFileSizeBytes(files []*FileSpec) (int64, error) {
+	var res int64 = 0
+	for _, f := range files {
+		res += f.LenBytes
+		// overflow?
+		if res < 0 {
+			return 0, fmt.Errorf("int64 overflow when computing total size of file content")
+		}
+	}
+	return res, nil
 }
 
 type DhtNode struct {
@@ -173,11 +206,120 @@ func (x *FileSpec) UnmarshalBencode(raw []byte) error {
 	}
 	for _, s := range tmp.Path {
 		if err := validateUtf8Str(s); err != nil {
-			return fmt.Errorf("path list segment for FileSpec is not valid UTF-8 string. Bytes: %v", []byte(s))
+			return fmt.Errorf("path list segment for FileSpec is not valid UTF-8 string: %w", err)
 		}
 	}
 	// all path segments are valid UTF-8 encoded strings, create os specific file path
 	x.Path = filepath.Join(tmp.Path...)
 	x.LenBytes = tmp.LenBytes
+	return nil
+}
+
+type TrackerRsp struct {
+	FailureReason *string
+	WarningMsg    *string
+	PollInterval  *time.Duration
+	TrackerID     *string
+	SeederCnt     *int
+	LeecherCnt    *int
+	PeerAddrs     PeerAddrs
+}
+
+func (x *TrackerRsp) UnmarshalBencode(raw []byte) error {
+	tmp := struct {
+		FailureReason          *string   `bencode:"failure reason,omitempty"`
+		WarningMsg             *string   `bencode:"warning message,omitempty"`
+		PollIntervalSeconds    *int64    `bencode:"interval,omitempty"`
+		MinPollIntervalSeconds *int64    `bencode:"min interval,omitempty"`
+		TrackerID              *string   `bencode:"tracker id,omitempty"`
+		SeederCnt              *int      `bencode:"complete,omitempty"`
+		LeecherCnt             *int      `bencode:"incomplete,omitempty"`
+		PeerAddrs              PeerAddrs `bencode:"peers,omitempty"`
+	}{}
+	if err := bencode.Unmarshal(raw, &tmp); err != nil {
+		return fmt.Errorf("error decoding anonymous struct for TrackerRsp: %w", err)
+	}
+	if ptr := tmp.FailureReason; ptr != nil {
+		if err := validateUtf8Str(*ptr); err != nil {
+			return fmt.Errorf("failure reason presents in tracker response but is invalid UTF-8 sring: %w", err)
+		}
+		x.FailureReason = ptr
+		// no need to parse other attributes as they will be absent in failure case
+		return nil
+	}
+	if ptr := tmp.WarningMsg; ptr != nil {
+		if err := validateUtf8Str(*ptr); err != nil {
+			return fmt.Errorf("warning message presents in tracker response but is invalid UTF-8 sring: %w", err)
+		}
+		x.WarningMsg = ptr
+	}
+	var pollIntervalSeconds int64 = 0
+	if ptr := tmp.PollIntervalSeconds; ptr != nil {
+		pollIntervalSeconds = *ptr
+	}
+	if ptr := tmp.MinPollIntervalSeconds; ptr != nil {
+		pollIntervalSeconds = *ptr
+	}
+	duration := time.Duration(pollIntervalSeconds) * time.Second
+	x.PollInterval = &duration
+	x.TrackerID = tmp.TrackerID
+	x.SeederCnt = tmp.SeederCnt
+	x.LeecherCnt = tmp.LeecherCnt
+	x.PeerAddrs = tmp.PeerAddrs
+	return nil
+}
+
+// peer address in form of concatenation of hostname and port
+type PeerAddrs []string
+
+// bittorrent peer address. NOTE only use this in bdecode
+//type PeerAddr struct {
+//	// peer ID seems useless so exclude it for now
+//	Hostname string
+//	Port     int
+//}
+
+func (x *PeerAddrs) UnmarshalBencode(raw []byte) error {
+	// parse peer list in binary mode first as this is preferred by trackers, if parsing encountered error
+	// then continue parsing in list-of-dictionary mode
+	// for a peer list to be in binary mode the length of decoded peer list string must be divisible by 6.
+	if peersStr := ""; bencode.Unmarshal(raw, &peersStr) == nil && len(peersStr)%6 == 0 {
+		// possibly binary mode
+		var tmp []string
+		err := false
+		ln := len(peersStr)
+		for idx := 0; idx < ln; idx += 6 {
+			// read ip address in ipv4 format. TODO see how endian-ness can impact parsing result
+			hostname := fmt.Sprintf("%d.%d.%d.%d", peersStr[idx], peersStr[idx+1], peersStr[idx+2], peersStr[idx+3])
+			if net.ParseIP(hostname) == nil {
+				fmt.Fprintf(os.Stderr, "error parsing ip address in peer list: %s peer list may be in list-of-dictionary mode", hostname)
+				err = true
+				break
+			}
+			port := int(binary.BigEndian.Uint16([]byte(peersStr[idx+4 : idx+6])))
+			tmp = append(tmp, net.JoinHostPort(hostname, strconv.Itoa(port)))
+		}
+		if !err {
+			*x = tmp
+			return nil
+		}
+		// otherwise proceed to parsing via list-of-dictionary mode
+	} else if peersStr != "" {
+		// here the raw data represents a (malformed) bencoded string instead of dictionary
+		return fmt.Errorf("malformed peer list in binary mode: decoded peer list string doesn't have length divisible by 6")
+	}
+	type PeerAddr struct {
+		Hostname string `bencode:"ip"`
+		Port     int    `bencode:"port"`
+	}
+	tmp := []*PeerAddr{}
+	if err := bencode.Unmarshal(raw, &tmp); err != nil {
+		// raw is either malformed or encoded in binary mode
+		return fmt.Errorf("error decoding peer list in both binary and list-of-dictionary mode: %w", err)
+	}
+	for _, a := range tmp {
+		// TODO validation against hostname and port
+		*x = append(*x, net.JoinHostPort(a.Hostname, strconv.Itoa(a.Port)))
+	}
 	return nil
 }
